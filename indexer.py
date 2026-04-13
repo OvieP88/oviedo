@@ -63,34 +63,44 @@ def claim_job():
 # -------------------------
 # DOWNLOAD VIDEO
 # -------------------------
-def download_video(vid, out_path):
+def get_stream_url(vid):
     url = f"https://youtu.be/{vid}"
-
-    base_cmd = [
+    cmd = [
         "yt-dlp",
         "--no-warnings",
-        "--sleep-interval", "3",
-        "--max-sleep-interval", "8",
-        "--retries", "5",
-        "--fragment-retries", "5",
         "--extractor-args", "youtube:player_client=android",
         "--user-agent", "com.google.android.youtube/17.31.35 (Linux; U; Android 11) gzip",
+        "-g",
         "-f", "best[height<=360]/best",
-        "-o", str(out_path),
         url
     ]
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+    if r.returncode != 0:
+        raise Exception(f"stream URL failed: {r.stderr[:100]}")
+    return r.stdout.strip().split("\n")[0]
 
-    if COOKIE_PATH.exists() and COOKIE_PATH.stat().st_size > 0:
-        try:
-            print("🍪 Trying with cookies...")
-            cmd = ["yt-dlp", "--cookies", str(COOKIE_PATH)] + base_cmd[1:]
-            subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=900)
-            return
-        except Exception as e:
-            print(f"⚠️ Cookie failed: {e}")
+def extract_frames(vid, stream_url, duration):
+    frames = []
+    start  = 600
+    end    = max(duration - 120, start + 1)
 
-    print("🌐 Downloading without cookies...")
-    subprocess.run(base_cmd, check=True, capture_output=True, text=True, timeout=900)
+    for idx, ts in enumerate(range(start, end, 10)):
+        fp = WORK_DIR / f"{vid}_{idx:04d}.jpg"
+        cmd = [
+            "ffmpeg", "-y",
+            "-ss", str(ts),
+            "-i", stream_url,
+            "-vframes", "1",
+            "-q:v", "3",
+            "-vf", "scale=640:-1",
+            str(fp),
+            "-loglevel", "error"
+        ]
+        subprocess.run(cmd, capture_output=True, timeout=30)
+        if fp.exists() and fp.stat().st_size > 3000:
+            frames.append((fp, ts, idx))
+
+    return frames
   
 # -------------------------
 # GET DURATION
@@ -161,64 +171,57 @@ def flush_embeddings(images, meta, vid):
 # PROCESS JOB
 # -------------------------
 def process(job):
-    vid = job["youtube_id"]
+    vid   = job["youtube_id"]
     title = job.get("title", "Unknown")
-    video_path = WORK_DIR / f"{vid}.mp4"
 
     print(f"\n🎬 Processing: {title[:50]} ({vid})")
 
     try:
-        download_video(vid, video_path)
-        duration = get_duration(video_path)
+        stream_url = get_stream_url(vid)
+        print(f"✅ Stream URL obtained")
+
+        # Get duration via yt-dlp metadata (no download)
+        info_cmd = [
+            "yt-dlp", "--no-warnings",
+            "--extractor-args", "youtube:player_client=android",
+            "--dump-json", f"https://youtu.be/{vid}"
+        ]
+        info = subprocess.run(info_cmd, capture_output=True, text=True, timeout=60)
+        import json
+        duration = int(json.loads(info.stdout).get("duration", 5400))
         print(f"⏱ Duration: {duration}s")
 
-        if duration < 660:
-            raise Exception("Video too short")
-
-        frames = extract_frames(video_path, vid, duration)
+        frames = extract_frames(vid, stream_url, duration)
+        print(f"🖼 {len(frames)} frames extracted")
 
         if not frames:
             raise Exception("No frames extracted")
 
         total_saved = 0
-
         for i in range(0, len(frames), 16):
             batch = frames[i:i+16]
-
-            # ✅ FIXED image handling
-            imgs = []
-            for fp, _, _ in batch:
-                img = Image.open(fp).convert("RGB")
-                imgs.append(img)
-
+            imgs  = [Image.open(fp).convert("RGB") for fp, _, _ in batch]
             total_saved += flush_embeddings(imgs, batch, vid)
-
-            # ✅ prevent memory leak
             for img in imgs:
                 img.close()
 
         sb.table("movies").update({
-            "status": "processed",
+            "status"     : "processed",
             "frame_count": total_saved,
-            "indexed_at": datetime.utcnow().isoformat(),
-            "error_msg": None
+            "indexed_at" : datetime.utcnow().isoformat(),
+            "error_msg"  : None
         }).eq("youtube_id", vid).execute()
 
         print(f"✅ Success: {total_saved} embeddings")
 
     except Exception as e:
         print(f"❌ FAILED: {e}")
-
         retries = job.get("retries", 0)
-
-        status = "failed" if retries >= 3 else "pending"
-
         sb.table("movies").update({
-            "status": status,
-            "retries": retries + 1,
+            "status"   : "failed" if retries >= 3 else "pending",
+            "retries"  : retries + 1,
             "error_msg": str(e)[:200]
         }).eq("youtube_id", vid).execute()
-
     finally:
         if video_path.exists():
             video_path.unlink()
