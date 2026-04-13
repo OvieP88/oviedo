@@ -39,7 +39,7 @@ def process(movie):
 
     if r.returncode != 0 or not out.exists():
         print(f"  ❌ Download failed: {r.stderr[-100:]}")
-        sb.table("movies").update({"status":"failed"}).eq("youtube_id",vid).execute()
+        sb.table("movies").update({"status":"error","error_msg":"download_failed"}).eq("youtube_id",vid).execute()
         return
 
     size = out.stat().st_size/1024/1024
