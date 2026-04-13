@@ -66,38 +66,31 @@ def claim_job():
 def download_video(vid, out_path):
     url = f"https://youtu.be/{vid}"
 
-base_cmd = [
-    "yt-dlp",
-    "--no-warnings",
-    "--sleep-interval", "3",
-    "--max-sleep-interval", "8",
-    "--retries", "5",
-    "--fragment-retries", "5",
-    "--extractor-args", "youtube:player_client=android",
-    "--user-agent", "com.google.android.youtube/17.31.35 (Linux; U; Android 11) gzip",
-    "-f", "best[height<=360]/best",
-    "-o", str(out_path),
-    url
-]
-    # Try with cookies first
+    base_cmd = [
+        "yt-dlp",
+        "--no-warnings",
+        "--sleep-interval", "3",
+        "--max-sleep-interval", "8",
+        "--retries", "5",
+        "--fragment-retries", "5",
+        "--extractor-args", "youtube:player_client=android",
+        "--user-agent", "com.google.android.youtube/17.31.35 (Linux; U; Android 11) gzip",
+        "-f", "best[height<=360]/best",
+        "-o", str(out_path),
+        url
+    ]
+
     if COOKIE_PATH.exists() and COOKIE_PATH.stat().st_size > 0:
         try:
             print("🍪 Trying with cookies...")
-            subprocess.run(
-                ["yt-dlp", "--cookies", str(COOKIE_PATH)] + base_cmd[1:],
-                check=True,
-                capture_output=True,
-                text=True,
-                timeout=900
-            )
+            cmd = ["yt-dlp", "--cookies", str(COOKIE_PATH)] + base_cmd[1:]
+            subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=900)
             return
         except Exception as e:
             print(f"⚠️ Cookie failed: {e}")
 
-    # Fallback
-    print("🌐 Retrying without cookies...")
+    print("🌐 Downloading without cookies...")
     subprocess.run(base_cmd, check=True, capture_output=True, text=True, timeout=900)
-
   
 # -------------------------
 # GET DURATION
