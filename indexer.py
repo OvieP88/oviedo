@@ -66,18 +66,19 @@ def claim_job():
 def download_video(vid, out_path):
     url = f"https://youtu.be/{vid}"
 
-    base_cmd = [
-        "yt-dlp",
-        "--no-warnings",
-        "--sleep-interval", "3",
-        "--max-sleep-interval", "8",
-        "--retries", "5",
-        "--fragment-retries", "5",
-        "-f", "best[height<=360]",
-        "-o", str(out_path),
-        url
-    ]
-
+base_cmd = [
+    "yt-dlp",
+    "--no-warnings",
+    "--sleep-interval", "3",
+    "--max-sleep-interval", "8",
+    "--retries", "5",
+    "--fragment-retries", "5",
+    "--extractor-args", "youtube:player_client=android",
+    "--user-agent", "com.google.android.youtube/17.31.35 (Linux; U; Android 11) gzip",
+    "-f", "best[height<=360]/best",
+    "-o", str(out_path),
+    url
+]
     # Try with cookies first
     if COOKIE_PATH.exists() and COOKIE_PATH.stat().st_size > 0:
         try:
