@@ -25,6 +25,10 @@ COOKIE_PATH = "/tmp/yt_cookies.txt"
 if cookies_content:
     pathlib.Path(COOKIE_PATH).write_text(cookies_content)
 
+
+print("COOKIE EXISTS:", os.path.exists(COOKIE_PATH))
+print("COOKIE SIZE:", len(cookies_content or ""))
+
 # -------------------------
 # LOAD MODEL
 # -------------------------
@@ -71,20 +75,19 @@ def download_video(vid, out_path):
     cmd = [
         "yt-dlp",
         "--no-warnings",
-        "-f", "bestvideo+bestaudio/best",        
+        "--cookies", COOKIE_PATH,
+        "--sleep-interval", "2",
+        "--max-sleep-interval", "5",
+        "-f", "bestvideo+bestaudio/best",
         "--merge-output-format", "mp4",
         "-o", str(out_path),
         url
     ]
 
-    if os.path.exists(COOKIE_PATH):
-        cmd.insert(1, "--cookies")
-        cmd.insert(2, COOKIE_PATH)
-
     r = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
 
-    if r.returncode != 0 or not out_path.exists():
-        raise Exception(f"yt-dlp failed: {r.stderr[-200:]}")
+    if r.returncode != 0:
+        raise Exception(r.stderr[-300:])
 
 # -------------------------
 # GET DURATION
@@ -240,3 +243,4 @@ while True:
         continue
 
     process(job)
+    time.sleep(3)
