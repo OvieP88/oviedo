@@ -3,6 +3,12 @@ from pathlib import Path
 from PIL import Image
 from transformers import CLIPProcessor, CLIPModel
 from supabase import create_client
+# Write cookies from secret
+import os, pathlib
+cookies_content = os.environ.get("YOUTUBE_COOKIES", "")
+if cookies_content:
+    pathlib.Path("/tmp/yt_cookies.txt").write_text(cookies_content)
+
 
 sb = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_KEY"])
 WORK_DIR = Path("/tmp/screensox")
