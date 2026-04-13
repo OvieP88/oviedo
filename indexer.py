@@ -59,6 +59,7 @@ def claim_job():
     }).eq("youtube_id", vid).eq("status", "pending").execute()
 
     return job
+    time.sleep(5)
 
 # -------------------------
 # DOWNLOAD VIDEO
@@ -66,29 +67,38 @@ def claim_job():
 def download_video(vid, out_path):
     url = f"https://youtu.be/{vid}"
 
-    cmd = [
+    base_cmd = [
         "yt-dlp",
         "--no-warnings",
-        "--retries", "3",
-        "--fragment-retries", "3",
-        "--sleep-interval", "2",
-        "--max-sleep-interval", "5",
-        "-f", "bv*[height<=360]+ba/b[height<=360]/best",  # ✅ FIXED FORMAT
-        "--merge-output-format", "mp4",
+        "--sleep-interval", "3",
+        "--max-sleep-interval", "8",
+        "--retries", "5",
+        "--fragment-retries", "5",
+        "-f", "best[height<=360]",
         "-o", str(out_path),
         url
     ]
 
-    # ✅ Safe cookie usage
+    # Try with cookies first
     if COOKIE_PATH.exists() and COOKIE_PATH.stat().st_size > 0:
-        cmd += ["--cookies", str(COOKIE_PATH)]
+        try:
+            print("🍪 Trying with cookies...")
+            subprocess.run(
+                ["yt-dlp", "--cookies", str(COOKIE_PATH)] + base_cmd[1:],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=900
+            )
+            return
+        except Exception as e:
+            print(f"⚠️ Cookie failed: {e}")
 
-    r = subprocess.run(cmd, capture_output=True, text=True, timeout=900)
+    # Fallback
+    print("🌐 Retrying without cookies...")
+    subprocess.run(base_cmd, check=True, capture_output=True, text=True, timeout=900)
 
-    if r.returncode != 0 or not out_path.exists():
-        err = r.stderr[-300:] if r.stderr else "Unknown yt-dlp error"
-        raise Exception(f"Download failed: {err}")
-
+  
 # -------------------------
 # GET DURATION
 # -------------------------
