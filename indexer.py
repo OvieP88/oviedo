@@ -81,11 +81,11 @@ def process(movie):
                 v = model.vision_model(pixel_values=inp["pixel_values"])
                 feat = model.visual_projection(v.pooler_output)
                 feat = feat/feat.norm(p=2,dim=-1,keepdim=True)
-            batch.append({"youtube_id":vid,"frame_name":fp.name,
-                          "timestamp_sec":ts,"vector":json.dumps(feat[0].tolist())})
+            batch.append({"youtube_id":vid,"frame_index":i,
+                "timestamp_sec":ts,"embedding":feat[0].tolist()})
             fp.unlink(missing_ok=True)
             if len(batch)>=100:
-                sb.table("clip_frames").insert(batch).execute()
+            sb.table("embeddings").insert(batch).execute()
                 saved+=len(batch); batch=[]
         except Exception as e:
             print(f"  ⚠️ {e}")
