@@ -1,114 +1,242 @@
-import os, subprocess, pathlib, torch
+import os
+import time
+import subprocess
 from pathlib import Path
+import pathlib
+import torch
 from PIL import Image
 from transformers import CLIPProcessor, CLIPModel
 from supabase import create_client
 
-# Write cookies from secret
-cookies_content = os.environ.get("YOUTUBE_COOKIES", "")
-if cookies_content:
-    pathlib.Path("/tmp/yt_cookies.txt").write_text(cookies_content)
+# -------------------------
+# ENV SETUP
+# -------------------------
+SUPABASE_URL = os.environ["SUPABASE_URL"]
+SUPABASE_KEY = os.environ["SUPABASE_KEY"]
 
-sb = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_KEY"])
+sb = create_client(SUPABASE_URL, SUPABASE_KEY)
+
 WORK_DIR = Path("/tmp/screensox")
 WORK_DIR.mkdir(exist_ok=True)
 
-print("Loading CLIP...")
-model     = CLIPModel.from_pretrained("openai/clip-vit-base-patch32")
+# Write cookies if provided
+cookies_content = os.environ.get("YOUTUBE_COOKIES")
+COOKIE_PATH = "/tmp/yt_cookies.txt"
+if cookies_content:
+    pathlib.Path(COOKIE_PATH).write_text(cookies_content)
+
+# -------------------------
+# LOAD MODEL
+# -------------------------
+print("🔄 Loading CLIP...")
+device = "cuda" if torch.cuda.is_available() else "cpu"
+
+model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32").to(device)
 processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
+
 model.eval()
-print("CLIP ready")
+print(f"✅ CLIP ready on {device}")
 
-def get_batch():
-    r = sb.table("movies").select("youtube_id,title").eq("status","pending").limit(10).execute()
-    return r.data or []
+# -------------------------
+# JOB CLAIMING (SAFE)
+# -------------------------
+def claim_job():
+    """Atomically claim 1 pending job"""
+    res = sb.table("movies") \
+        .select("*") \
+        .eq("status", "pending") \
+        .limit(1) \
+        .execute()
 
-def process(movie):
-    vid = movie["youtube_id"]
+    jobs = res.data
+    if not jobs:
+        return None
+
+    job = jobs[0]
+    vid = job["youtube_id"]
+
+    # attempt to lock it
+    sb.table("movies").update({
+        "status": "processing"
+    }).eq("youtube_id", vid).eq("status", "pending").execute()
+
+    return job
+
+# -------------------------
+# DOWNLOAD VIDEO
+# -------------------------
+def download_video(vid, out_path):
     url = f"https://youtu.be/{vid}"
-    print(f"\n🎬 {movie['title'][:50]}")
-    out = WORK_DIR / f"{vid}.mp4"
-    sb.table("movies").update({"status":"processing"}).eq("youtube_id",vid).execute()
 
-    r = subprocess.run([
-        "yt-dlp","--no-warnings","-f","worst[ext=mp4]/worst",
-        "--merge-output-format","mp4","-o",str(out),url
-    ], capture_output=True, text=True, timeout=600)
+    cmd = [
+        "yt-dlp",
+        "--no-warnings",
+        "-f", "worst[ext=mp4]/worst",
+        "--merge-output-format", "mp4",
+        "-o", str(out_path),
+        url
+    ]
 
-    if r.returncode != 0 or not out.exists():
-        print(f"  ❌ Download failed: {r.stderr[-200:]}")
-        sb.table("movies").update({"status":"error","error_msg":"download_failed"}).eq("youtube_id",vid).execute()
-        return
+    if os.path.exists(COOKIE_PATH):
+        cmd.insert(1, "--cookies")
+        cmd.insert(2, COOKIE_PATH)
 
-    size = out.stat().st_size / 1024 / 1024
-    print(f"  ✅ {size:.1f}MB downloaded")
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
 
-    # Get duration
-    probe    = subprocess.run(["ffmpeg","-i",str(out)], capture_output=True, text=True)
-    duration = 6000
-    for line in probe.stderr.split("\n"):
-        if "Duration" in line:
-            try:
-                t    = line.split("Duration:")[1].split(",")[0].strip()
-                h,m,s = t.split(":")
-                duration = int(h)*3600 + int(m)*60 + int(float(s))
-            except:
-                pass
+    if r.returncode != 0 or not out_path.exists():
+        raise Exception(f"yt-dlp failed: {r.stderr[-200:]}")
 
-    # Extract frames every 10s
+# -------------------------
+# GET DURATION
+# -------------------------
+def get_duration(path):
+    cmd = [
+        "ffprobe", "-v", "error", "-show_entries", "format=duration",
+        "-of", "default=noprint_wrappers=1:nokey=1", str(path)
+    ]
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    try:
+        return int(float(r.stdout.strip()))
+    except:
+        return 0
+
+# -------------------------
+# EXTRACT FRAMES
+# -------------------------
+def extract_frames(video_path, vid, duration):
     frames = []
-    for idx, ts in enumerate(range(600, duration - 120, 10)):
-        fp = WORK_DIR / f"{vid}_{idx:04d}.jpg"
+
+    for idx, ts in enumerate(range(600, max(duration - 120, 600), 15)):
+        fp = WORK_DIR / f"{vid}_{idx}.jpg"
+
         subprocess.run([
-            "ffmpeg","-y","-ss",str(ts),"-i",str(out),
-            "-vframes","1","-q:v","3","-vf","scale=640:-1",str(fp)
-        ], capture_output=True, timeout=30)
+            "ffmpeg", "-y",
+            "-ss", str(ts),
+            "-i", str(video_path),
+            "-vframes", "1",
+            "-q:v", "3",
+            "-vf", "scale=640:-1",
+            str(fp)
+        ], capture_output=True)
+
         if fp.exists() and fp.stat().st_size > 3000:
             frames.append((fp, ts, idx))
 
-    out.unlink(missing_ok=True)
-    print(f"  ✅ {len(frames)} frames extracted")
+    return frames
 
-    # Embed and save
-    batch, saved = [], 0
-    for fp, ts, frame_idx in frames:
+# -------------------------
+# EMBEDDING
+# -------------------------
+def embed_and_store(frames, vid):
+    batch_imgs = []
+    meta = []
+    saved = 0
+
+    for fp, ts, idx in frames:
         try:
-            img  = Image.open(fp).convert("RGB")
-            inp  = processor(images=img, return_tensors="pt")
-            with torch.no_grad():
-                v    = model.vision_model(pixel_values=inp["pixel_values"])
-                feat = model.visual_projection(v.pooler_output)
-                feat = feat / feat.norm(p=2, dim=-1, keepdim=True)
-            batch.append({
-                "youtube_id"   : vid,
-                "frame_index"  : frame_idx,
-                "timestamp_sec": ts,
-                "embedding"    : feat[0].tolist()
-            })
-            fp.unlink(missing_ok=True)
+            img = Image.open(fp).convert("RGB")
+            batch_imgs.append(img)
+            meta.append((fp, ts, idx))
 
-            if len(batch) >= 100:
-                sb.table("embeddings").insert(batch).execute()
-                saved += len(batch)
-                batch  = []
+            if len(batch_imgs) >= 16:
+                saved += flush_embeddings(batch_imgs, meta, vid)
+                batch_imgs, meta = [], []
 
         except Exception as e:
-            print(f"  ⚠️ {e}")
+            print(f"⚠️ Image error: {e}")
 
-    if batch:
-        sb.table("embeddings").insert(batch).execute()
-        saved += len(batch)
+    if batch_imgs:
+        saved += flush_embeddings(batch_imgs, meta, vid)
 
-    sb.table("movies").update({
-        "status"    : "processed",
-        "frame_count": saved,
-        "indexed_at": "now()"
-    }).eq("youtube_id", vid).execute()
-    print(f"  ✅ {saved} embeddings saved → processed")
+    return saved
 
-# Main
-movies = get_batch()
-print(f"📋 {len(movies)} pending movies")
-for m in movies:
-    process(m)
-print("\n✅ Done")
+def flush_embeddings(images, meta, vid):
+    inputs = processor(images=images, return_tensors="pt").to(device)
+
+    with torch.no_grad():
+        feats = model.get_image_features(**inputs)
+        feats = feats / feats.norm(p=2, dim=-1, keepdim=True)
+
+    rows = []
+    for i, (fp, ts, idx) in enumerate(meta):
+        rows.append({
+            "youtube_id": vid,
+            "frame_index": idx,
+            "timestamp_sec": ts,
+            "embedding": feats[i].cpu().tolist()
+        })
+        fp.unlink(missing_ok=True)
+
+    res = sb.table("embeddings").insert(rows).execute()
+
+    if res.data is None:
+        raise Exception("Embedding insert failed")
+
+    return len(rows)
+
+# -------------------------
+# PROCESS JOB
+# -------------------------
+def process(job):
+    vid = job["youtube_id"]
+    title = job.get("title", "")
+
+    print(f"\n🎬 Processing: {title[:50]}")
+
+    video_path = WORK_DIR / f"{vid}.mp4"
+
+    try:
+        # download
+        download_video(vid, video_path)
+        print("✅ Downloaded")
+
+        # duration
+        duration = get_duration(video_path)
+        print(f"⏱ Duration: {duration}s")
+
+        if duration < 600:
+            raise Exception("Video too short")
+
+        # frames
+        frames = extract_frames(video_path, vid, duration)
+        print(f"🖼 Frames: {len(frames)}")
+
+        if not frames:
+            raise Exception("No frames extracted")
+
+        # embeddings
+        saved = embed_and_store(frames, vid)
+        print(f"✅ Embeddings: {saved}")
+
+        # mark success
+        sb.table("movies").update({
+            "status": "processed",
+            "frame_count": saved,
+            "indexed_at": "now()"
+        }).eq("youtube_id", vid).execute()
+
+    except Exception as e:
+        print(f"❌ FAILED: {e}")
+
+        sb.table("movies").update({
+            "status": "failed",
+            "error_msg": str(e)[:200]
+        }).eq("youtube_id", vid).execute()
+
+    finally:
+        video_path.unlink(missing_ok=True)
+
+# -------------------------
+# MAIN WORKER LOOP
+# -------------------------
+print("🚀 Worker started")
+
+while True:
+    job = claim_job()
+
+    if not job:
+        print("😴 No jobs. Sleeping...")
+        time.sleep(10)
+        continue
+
+    process(job)
