@@ -59,7 +59,6 @@ def claim_job():
     }).eq("youtube_id", vid).eq("status", "pending").execute()
 
     return job
-    time.sleep(5)
 
 # -------------------------
 # DOWNLOAD VIDEO
