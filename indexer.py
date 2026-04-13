@@ -71,7 +71,7 @@ def download_video(vid, out_path):
     cmd = [
         "yt-dlp",
         "--no-warnings",
-        "-f", "worst[ext=mp4]/worst",
+        "-f", "bestvideo+bestaudio/best",        
         "--merge-output-format", "mp4",
         "-o", str(out_path),
         url
