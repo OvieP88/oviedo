@@ -1,15 +1,16 @@
 import os
 import time
 import subprocess
+import shutil
 from pathlib import Path
-import pathlib
+from datetime import datetime
 import torch
 from PIL import Image
 from transformers import CLIPProcessor, CLIPModel
 from supabase import create_client
 
 # -------------------------
-# ENV SETUP
+# ENV SETUP & CLEANUP
 # -------------------------
 SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_KEY = os.environ["SUPABASE_KEY"]
@@ -17,17 +18,18 @@ SUPABASE_KEY = os.environ["SUPABASE_KEY"]
 sb = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 WORK_DIR = Path("/tmp/screensox")
-WORK_DIR.mkdir(exist_ok=True)
+if WORK_DIR.exists():
+    shutil.rmtree(WORK_DIR)
+WORK_DIR.mkdir(parents=True, exist_ok=True)
 
-# Write cookies if provided
+# Cookies (optional)
 cookies_content = os.environ.get("YOUTUBE_COOKIES")
-COOKIE_PATH = "/tmp/yt_cookies.txt"
+COOKIE_PATH = Path("/tmp/yt_cookies.txt")
 if cookies_content:
-    pathlib.Path(COOKIE_PATH).write_text(cookies_content)
+    COOKIE_PATH.write_text(cookies_content)
 
-
-print("COOKIE EXISTS:", os.path.exists(COOKIE_PATH))
-print("COOKIE SIZE:", len(cookies_content or ""))
+print(f"📦 Workspace: {WORK_DIR}")
+print(f"🍪 Cookie Setup: {'READY' if COOKIE_PATH.exists() else 'SKIPPED'}")
 
 # -------------------------
 # LOAD MODEL
@@ -39,27 +41,19 @@ model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32").to(device)
 processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
 
 model.eval()
-print(f"✅ CLIP ready on {device}")
+print(f"✅ CLIP ready on {device.upper()}")
 
 # -------------------------
-# JOB CLAIMING (SAFE)
+# JOB CLAIMING
 # -------------------------
 def claim_job():
-    """Atomically claim 1 pending job"""
-    res = sb.table("movies") \
-        .select("*") \
-        .eq("status", "pending") \
-        .limit(1) \
-        .execute()
-
-    jobs = res.data
-    if not jobs:
+    res = sb.table("movies").select("*").eq("status", "pending").limit(1).execute()
+    if not res.data:
         return None
 
-    job = jobs[0]
+    job = res.data[0]  # ✅ FIXED
     vid = job["youtube_id"]
 
-    # attempt to lock it
     sb.table("movies").update({
         "status": "processing"
     }).eq("youtube_id", vid).eq("status", "pending").execute()
@@ -75,27 +69,35 @@ def download_video(vid, out_path):
     cmd = [
         "yt-dlp",
         "--no-warnings",
-        "--cookies", COOKIE_PATH,
+        "--retries", "3",
+        "--fragment-retries", "3",
         "--sleep-interval", "2",
         "--max-sleep-interval", "5",
-        "-f", "bestvideo+bestaudio/best",
+        "-f", "bv*[height<=360]+ba/b[height<=360]/best",  # ✅ FIXED FORMAT
         "--merge-output-format", "mp4",
         "-o", str(out_path),
         url
     ]
 
-    r = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+    # ✅ Safe cookie usage
+    if COOKIE_PATH.exists() and COOKIE_PATH.stat().st_size > 0:
+        cmd += ["--cookies", str(COOKIE_PATH)]
 
-    if r.returncode != 0:
-        raise Exception(r.stderr[-300:])
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=900)
+
+    if r.returncode != 0 or not out_path.exists():
+        err = r.stderr[-300:] if r.stderr else "Unknown yt-dlp error"
+        raise Exception(f"Download failed: {err}")
 
 # -------------------------
 # GET DURATION
 # -------------------------
 def get_duration(path):
     cmd = [
-        "ffprobe", "-v", "error", "-show_entries", "format=duration",
-        "-of", "default=noprint_wrappers=1:nokey=1", str(path)
+        "ffprobe", "-v", "error",
+        "-show_entries", "format=duration",
+        "-of", "default=noprint_wrappers=1:nokey=1",
+        str(path)
     ]
     r = subprocess.run(cmd, capture_output=True, text=True)
     try:
@@ -108,8 +110,10 @@ def get_duration(path):
 # -------------------------
 def extract_frames(video_path, vid, duration):
     frames = []
+    start = 600
+    end = max(duration - 120, start + 1)
 
-    for idx, ts in enumerate(range(600, max(duration - 120, 600), 15)):
+    for idx, ts in enumerate(range(start, end, 15)):
         fp = WORK_DIR / f"{vid}_{idx}.jpg"
 
         subprocess.run([
@@ -130,29 +134,6 @@ def extract_frames(video_path, vid, duration):
 # -------------------------
 # EMBEDDING
 # -------------------------
-def embed_and_store(frames, vid):
-    batch_imgs = []
-    meta = []
-    saved = 0
-
-    for fp, ts, idx in frames:
-        try:
-            img = Image.open(fp).convert("RGB")
-            batch_imgs.append(img)
-            meta.append((fp, ts, idx))
-
-            if len(batch_imgs) >= 16:
-                saved += flush_embeddings(batch_imgs, meta, vid)
-                batch_imgs, meta = [], []
-
-        except Exception as e:
-            print(f"⚠️ Image error: {e}")
-
-    if batch_imgs:
-        saved += flush_embeddings(batch_imgs, meta, vid)
-
-    return saved
-
 def flush_embeddings(images, meta, vid):
     inputs = processor(images=images, return_tensors="pt").to(device)
 
@@ -170,11 +151,7 @@ def flush_embeddings(images, meta, vid):
         })
         fp.unlink(missing_ok=True)
 
-    res = sb.table("embeddings").insert(rows).execute()
-
-    if res.data is None:
-        raise Exception("Embedding insert failed")
-
+    sb.table("embeddings").insert(rows).execute()
     return len(rows)
 
 # -------------------------
@@ -182,55 +159,69 @@ def flush_embeddings(images, meta, vid):
 # -------------------------
 def process(job):
     vid = job["youtube_id"]
-    title = job.get("title", "")
-
-    print(f"\n🎬 Processing: {title[:50]}")
-
+    title = job.get("title", "Unknown")
     video_path = WORK_DIR / f"{vid}.mp4"
 
-    try:
-        # download
-        download_video(vid, video_path)
-        print("✅ Downloaded")
+    print(f"\n🎬 Processing: {title[:50]} ({vid})")
 
-        # duration
+    try:
+        download_video(vid, video_path)
         duration = get_duration(video_path)
         print(f"⏱ Duration: {duration}s")
 
-        if duration < 600:
+        if duration < 660:
             raise Exception("Video too short")
 
-        # frames
         frames = extract_frames(video_path, vid, duration)
-        print(f"🖼 Frames: {len(frames)}")
 
         if not frames:
             raise Exception("No frames extracted")
 
-        # embeddings
-        saved = embed_and_store(frames, vid)
-        print(f"✅ Embeddings: {saved}")
+        total_saved = 0
 
-        # mark success
+        for i in range(0, len(frames), 16):
+            batch = frames[i:i+16]
+
+            # ✅ FIXED image handling
+            imgs = []
+            for fp, _, _ in batch:
+                img = Image.open(fp).convert("RGB")
+                imgs.append(img)
+
+            total_saved += flush_embeddings(imgs, batch, vid)
+
+            # ✅ prevent memory leak
+            for img in imgs:
+                img.close()
+
         sb.table("movies").update({
             "status": "processed",
-            "frame_count": saved,
-            "indexed_at": "now()"
+            "frame_count": total_saved,
+            "indexed_at": datetime.utcnow().isoformat(),
+            "error_msg": None
         }).eq("youtube_id", vid).execute()
+
+        print(f"✅ Success: {total_saved} embeddings")
 
     except Exception as e:
         print(f"❌ FAILED: {e}")
 
+        retries = job.get("retries", 0)
+
+        status = "failed" if retries >= 3 else "pending"
+
         sb.table("movies").update({
-            "status": "failed",
+            "status": status,
+            "retries": retries + 1,
             "error_msg": str(e)[:200]
         }).eq("youtube_id", vid).execute()
 
     finally:
-        video_path.unlink(missing_ok=True)
+        if video_path.exists():
+            video_path.unlink()
 
 # -------------------------
-# MAIN WORKER LOOP
+# MAIN LOOP
 # -------------------------
 print("🚀 Worker started")
 
@@ -238,9 +229,11 @@ while True:
     job = claim_job()
 
     if not job:
-        print("😴 No jobs. Sleeping...")
-        time.sleep(10)
+        print("😴 No jobs. Sleeping 15s...")
+        time.sleep(15)
         continue
 
     process(job)
-    time.sleep(3)
+
+    # ✅ safer rate limiting
+    time.sleep(5)
