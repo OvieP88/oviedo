@@ -214,8 +214,9 @@ def process(job):
 print("\n🚀 Worker started")
 processed = 0
 
-while True:
+while processed < 10: # Only do 10 videos per hour
     job = claim_job()
+    # ... rest of code
 
     if not job:
         print(f"\n😴 No pending jobs. Total processed this run: {processed}")
