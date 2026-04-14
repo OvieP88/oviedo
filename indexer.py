@@ -57,33 +57,37 @@ def claim_job():
 # ── DOWNLOAD VIDEO ────────────────────────────────────────────
 def download_video(vid, out_path):
     url = f"https://youtu.be/{vid}"
-
-    base_cmd = [
-        "yt-dlp",
+    
+    # Base arguments: removed old User-Agent and specific client args 
+    # that often trigger 403 Forbidden errors in CI environments.
+    base_args = [
         "--no-warnings",
-        "--sleep-interval", "3",
-        "--max-sleep-interval", "8",
-        "--retries", "5",
-        "--fragment-retries", "5",
-        "--extractor-args", "youtube:player_client=android",
-        "--user-agent", "com.google.android.youtube/17.31.35 (Linux; U; Android 11) gzip",
-        "-f", "best[height<=360]/best",
-        "-o", str(out_path),
-        url
+        "--format", "best[height<=360]/best",
+        "--output", str(out_path),
+        "--socket-timeout", "30",
+        "--retries", "10",
     ]
 
-    # Try with cookies first if available
+    cmd = ["yt-dlp"] + base_args
+    
+    # Add cookies if they exist
     if COOKIE_PATH.exists() and COOKIE_PATH.stat().st_size > 0:
-        try:
-            print("🍪 Trying with cookies...")
-            cmd = ["yt-dlp", "--cookies", str(COOKIE_PATH)] + base_cmd[1:]
-            subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=900)
-            return
-        except Exception as e:
-            print(f"⚠️  Cookie download failed: {e}")
+        print("🍪 Using cookies for authentication...")
+        cmd.extend(["--cookies", str(COOKIE_PATH)])
+    else:
+        # If no cookies, try to impersonate a standard browser 
+        # instead of the old Android app string
+        cmd.extend(["--impersonate", "chrome"])
 
-    print("🌐 Downloading without cookies...")
-    subprocess.run(base_cmd, check=True, capture_output=True, text=True, timeout=900)
+    cmd.append(url)
+
+    print(f"🌐 Running: {' '.join(cmd)}")
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    
+    if result.returncode != 0:
+        # Log the actual error from yt-dlp so you can see it in GH Actions
+        error_info = result.stderr.strip().split('\n')[-1]
+        raise Exception(f"yt-dlp failed: {error_info}")
 
 # ── GET DURATION ──────────────────────────────────────────────
 def get_duration(path):
