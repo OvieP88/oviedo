@@ -25,7 +25,9 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y ffmpeg
-          pip install yt-dlp supabase python-dotenv torch torchvision transformers Pillow
+          # Force update yt-dlp to latest version every time
+          pip install -U yt-dlp 
+          pip install supabase python-dotenv torch torchvision transformers Pillow
 
       - name: Run indexer
         env:
